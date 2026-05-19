@@ -55,7 +55,7 @@ AgroNomi is a LoRa-based agricultural sensor/actuator network. ESP32 field nodes
   - `[HB]` — heartbeat
   - `[C]` / `[D]` — connect/disconnect events
 
-### Layer 3: mimi ↔ Hub (RNS over LoRa — two RNode radios)
+### Layer 3: mimi field gateway ↔ Hub (RNS over LoRa — two RNode radios)
 
 Each device has its own RNode LoRa USB radio. They communicate as peers over the Reticulum mesh — there is no shared radio or relay. All RNS communication uses **SINGLE destinations** with announce-based discovery. No manual destination hashes required — gateways discover the hub via RNS announces and vice versa.
 

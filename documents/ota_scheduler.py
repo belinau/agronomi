@@ -24,7 +24,7 @@ import RNS
 # CONFIGURATION — adjust these for your deployment
 # ---------------------------------------------------------------------------
 
-OTA_WINDOW_START = 21  # 21:00 local time
+OTA_WINDOW_START = 10  # 10:00 local time
 OTA_WINDOW_END = 24  # midnight — extended for testing
 OTA_MAX_RETRIES = 3  # per node per night
 OTA_RETRY_BACKOFF = [60, 180, 420]  # seconds: 1min, 3min, 7min

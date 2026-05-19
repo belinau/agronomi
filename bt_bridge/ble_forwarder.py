@@ -383,6 +383,7 @@ class GatewayCommandReceiver:
         gateway_id: str,
         ser: serial.Serial,
         config: dict = None,
+        telemetry_sender=None,
     ):
         self.destination = RNS.Destination(
             identity,
@@ -403,6 +404,7 @@ class GatewayCommandReceiver:
         # When an ota_request command arrives, we check this dict first,
         # then fall back to the disk cache.
         self._pending_firmware = {}
+        self._telemetry_sender = telemetry_sender
 
         # Register link establishment callback for RNS Resource (OTA) transfers.
         # The hub opens a Link to this destination, then sends the firmware
@@ -438,20 +440,67 @@ class GatewayCommandReceiver:
     def _on_resource(self, resource):
         """Called when an RNS Resource transfer is concluded.
 
-        The hub sends the firmware binary as a Resource over the Link.
-        When the transfer completes, we save the data to our firmware cache
-        and store it in _pending_firmware for the next ota_request command.
+        IMPORTANT: For large resources, RNS stores the reassembled data in a
+        temp file and sets resource.data to an open BufferedReader, NOT bytes.
+        RNS closes the file handle and deletes the temp file immediately after
+        this callback returns. We MUST read the data here before returning.
+        See RNS Resource.py L737: self.data = open(self.storagepath, "rb")
+        followed by close() + unlink() after callback.
+
+        We also save to disk cache IMMEDIATELY here, using a temporary filename
+        based on the SHA-256 of the data. This ensures the firmware persists even
+        if the gateway process crashes before the ota_request command arrives.
+        When the command arrives, _handle_ota_command will rename the cached file
+        to its proper version/type path.
         """
-        from fw_cache import save_firmware_to_cache
+        import hashlib
+
+        from fw_cache import OTA_CACHE_DIR, save_firmware_to_cache
 
         if resource.status == RNS.Resource.COMPLETE:
-            data = resource.data
+            # resource.data may be bytes (small resource) or BufferedReader
+            # (large resource stored to temp file). Read it before returning.
+            raw = resource.data
+            if isinstance(raw, bytes):
+                data = raw
+            else:
+                # BufferedReader — must .read() now; RNS deletes the file after
+                # this callback returns (Resource.py L743-744).
+                data = raw.read()
             RNS.log(f"[OTA] Resource received: {len(data)} bytes", RNS.LOG_INFO)
 
-            # We don't know the fw_version/device_type yet — that arrives
-            # in the subsequent ota_request command packet. For now, store
-            # the raw binary and let the command handler match it up.
-            # We use a special key to indicate "most recent resource".
+            # Compute SHA-256 immediately for cache identification
+            data_sha256 = hashlib.sha256(data).hexdigest()
+            RNS.log(
+                f"[OTA] Firmware SHA-256: {data_sha256[:16]}... ({len(data)} bytes)",
+                RNS.LOG_INFO,
+            )
+
+            # Save to disk cache IMMEDIATELY under a temporary name based on
+            # SHA-256. This ensures the firmware survives a process crash or
+            # restart — we don't have to re-transfer 1.4MB over LoRa.
+            # _handle_ota_command will rename this to the proper version/type path
+            # when it knows the fw_version and device_type from the command.
+            try:
+                tmp_dir = os.path.join(OTA_CACHE_DIR, "_pending")
+                os.makedirs(tmp_dir, exist_ok=True)
+                tmp_bin = os.path.join(tmp_dir, f"{data_sha256}.bin")
+                tmp_sha = os.path.join(tmp_dir, f"{data_sha256}.bin.sha256")
+                with open(tmp_bin, "wb") as f:
+                    f.write(data)
+                with open(tmp_sha, "w") as f:
+                    f.write(data_sha256)
+                RNS.log(
+                    f"[OTA] Firmware saved to pending cache: {data_sha256[:16]}...bin",
+                    RNS.LOG_INFO,
+                )
+            except Exception as e:
+                RNS.log(
+                    f"[OTA] Failed to save firmware to pending cache: {e}",
+                    RNS.LOG_ERROR,
+                )
+
+            # Also keep in memory for immediate use by _handle_ota_command
             self._pending_firmware["_latest"] = data
             RNS.log(
                 f"[OTA] Firmware binary cached in memory, awaiting ota_request command",
@@ -499,9 +548,15 @@ class GatewayCommandReceiver:
     def _handle_ota_command(self, cmd: dict):
         """Handle an ota_request command by checking cache and triggering BLE flash."""
         import asyncio
+        import hashlib
 
         from ble_ota import handle_ota_command
-        from fw_cache import fw_cache_path, get_cached_firmware, verify_cached_firmware
+        from fw_cache import (
+            OTA_CACHE_DIR,
+            fw_cache_path,
+            get_cached_firmware,
+            verify_cached_firmware,
+        )
 
         device_id = cmd.get("device_id", "?")
         # cmd_value_text may contain JSON with fw_version, device_type, sha256
@@ -529,21 +584,43 @@ class GatewayCommandReceiver:
             f"[OTA] Processing ota_request for {device_id} → {fw_version}", RNS.LOG_INFO
         )
 
-        # Check if firmware is in cache
-        # First, check if we received it via RNS Resource (in-memory)
+        # Check if firmware is available from any source:
+        # 1. In-memory (from RNS Resource callback in this process)
+        # 2. Pending cache (from RNS Resource callback, saved to disk by SHA-256)
+        # 3. Versioned cache (from a previous successful save with version/type)
         firmware_data = None
+
+        # Source 1: In-memory from RNS Resource callback
         if "_latest" in self._pending_firmware:
             firmware_data = self._pending_firmware.pop("_latest")
             RNS.log(
                 f"[OTA] Using firmware from RNS Resource ({len(firmware_data)} bytes)",
                 RNS.LOG_INFO,
             )
-            # Save to disk cache for reuse
-            if fw_version and device_type and sha256:
-                save_firmware_to_cache(fw_version, device_type, firmware_data, sha256)
 
+        # Source 2: Pending cache — firmware saved by _on_resource under SHA-256 name
+        # This handles the case where the process restarted after Resource delivery
+        # but before the ota_request command arrived.
         if firmware_data is None and sha256:
-            # Not in memory — check disk cache
+            tmp_dir = os.path.join(OTA_CACHE_DIR, "_pending")
+            tmp_bin = os.path.join(tmp_dir, f"{sha256}.bin")
+            if os.path.isfile(tmp_bin):
+                RNS.log(
+                    f"[OTA] Found firmware in pending cache: {sha256[:16]}...bin",
+                    RNS.LOG_INFO,
+                )
+                with open(tmp_bin, "rb") as f:
+                    firmware_data = f.read()
+                actual_sha = hashlib.sha256(firmware_data).hexdigest()
+                if actual_sha != sha256:
+                    RNS.log(
+                        f"[OTA] Pending cache SHA-256 mismatch! expected={sha256[:16]}... got={actual_sha[:16]}...",
+                        RNS.LOG_ERROR,
+                    )
+                    firmware_data = None
+
+        # Source 3: Versioned disk cache (from a previous full save)
+        if firmware_data is None and sha256:
             if verify_cached_firmware(fw_version, device_type, sha256):
                 firmware_data = get_cached_firmware(fw_version, device_type, sha256)
                 if firmware_data:
@@ -551,6 +628,35 @@ class GatewayCommandReceiver:
                         f"[OTA] Using cached firmware for {device_type} {fw_version} ({len(firmware_data)} bytes)",
                         RNS.LOG_INFO,
                     )
+
+        # Save to versioned disk cache for future reuse
+        if firmware_data is not None and fw_version and device_type and sha256:
+            try:
+                saved = save_firmware_to_cache(
+                    fw_version, device_type, firmware_data, sha256
+                )
+                if saved:
+                    RNS.log(
+                        f"[OTA] Firmware saved to disk cache: {fw_version}/{device_type}.bin",
+                        RNS.LOG_INFO,
+                    )
+                    # Clean up pending cache since we now have the versioned copy
+                    tmp_dir = os.path.join(OTA_CACHE_DIR, "_pending")
+                    tmp_bin = os.path.join(tmp_dir, f"{sha256}.bin")
+                    tmp_sha = os.path.join(tmp_dir, f"{sha256}.bin.sha256")
+                    for p in (tmp_bin, tmp_sha):
+                        if os.path.isfile(p):
+                            os.remove(p)
+                else:
+                    RNS.log(
+                        f"[OTA] Firmware cache save FAILED — SHA-256 mismatch!",
+                        RNS.LOG_ERROR,
+                    )
+            except Exception as e:
+                RNS.log(
+                    f"[OTA] Firmware cache save error: {e}",
+                    RNS.LOG_ERROR,
+                )
 
         if firmware_data is None:
             RNS.log(
@@ -690,7 +796,7 @@ def run_forwarder(config: dict, identity: RNS.Identity):
     # Create the command receiver for hub→gateway commands
     cmd_aspect = config["gateway"].get("command_aspect", "gateway_commands")
     cmd_receiver = GatewayCommandReceiver(
-        identity, cmd_aspect, gateway_id, ser, config=config
+        identity, cmd_aspect, gateway_id, ser, config=config, telemetry_sender=sender
     )
 
     # Announce immediately and set up periodic announce
