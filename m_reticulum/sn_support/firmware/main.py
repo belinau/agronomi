@@ -1,0 +1,353 @@
+"""µReticulum — Support Node Firmware (GW-SUPPORT-01)
+
+Lifecycle:
+  1. Initialise µReticulum + interfaces (RNodeBLEInterface reads ble_pin.txt,
+     force_pair.txt, ble_mac.txt itself — do NOT connect WiFi before this,
+     as wlan.active(True) inside RNodeBLEInterface.__init__ conflicts)
+  2. Connect WiFi (after interfaces are constructed)
+  3. Start BLE poll loops + transport job loop
+  4. Wait for interface online
+  5. Set up LXMRouter for LXMF receive
+  6. Announce on command channel
+  7. Read battery, send telemetry
+  8. Wait for hub announce (yielding to event loop each tick)
+  9. Listen for inbound LXMF commands (5 s)
+ 10. Deep sleep
+"""
+
+import gc
+import json
+import time
+
+import config
+import machine
+import uasyncio as asyncio
+
+from urns import Reticulum
+from urns.destination import Destination
+from urns.identity import Identity
+from urns.lxmf import LXMessage, LXMRouter
+from urns.packet import Packet
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+_hub_identity = None
+_lxm_router   = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _log(msg, level=1):
+    if config.DEBUG >= level:
+        print("[GW-SUPPORT] " + str(msg))
+
+
+def _get_rns_interface_name(rns):
+    for iface in rns.interfaces:
+        if hasattr(iface, "online") and iface.online:
+            return getattr(iface, "name", iface.__class__.__name__).lower()
+    return "none"
+
+
+def _connect_wifi(ssid, password, timeout=15):
+    import network
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+    time.sleep(0.1)
+    wlan.active(True)
+    if not wlan.isconnected():
+        wlan.connect(ssid, password)
+        start = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), start) // 1000 > timeout:
+                wlan.active(False)
+                raise RuntimeError("WiFi connection timed out")
+            time.sleep(0.2)
+    return wlan.ifconfig()[0]
+
+
+def _find_or_create_identity(storage_path):
+    Identity.storagepath = storage_path
+    identity_path = storage_path + "/identity"
+    try:
+        ident = Identity.from_file(identity_path)
+        if ident:
+            _log("Loaded identity: " + ident.hexhash)
+            return ident
+    except Exception:
+        pass
+    ident = Identity()
+    try:
+        ident.to_file(identity_path)
+        _log("Created new identity: " + ident.hexhash)
+    except Exception as e:
+        _log("Warning: could not persist identity: " + str(e))
+    return ident
+
+
+def _read_battery_v():
+    try:
+        from machine import ADC, Pin
+        adc = ADC(Pin(config.BAT_ADC_PIN))
+        adc.atten(ADC.ATTN_11DB)
+        raw = adc.read()
+        return (raw / 4095.0) * 3.3 * config.BAT_DIVIDER_RATIO
+    except Exception as e:
+        _log("Battery read error: " + str(e), 2)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# LXMF command handler
+# ---------------------------------------------------------------------------
+
+def _on_lxmf_delivery(message):
+    try:
+        if isinstance(message.content, (bytes, bytearray)):
+            payload_str = message.content.decode("utf-8")
+        else:
+            payload_str = str(message.content)
+        payload = json.loads(payload_str)
+        cmd = payload.get("cmd", "")
+        _log("LXMF command: " + cmd, 1)
+        if cmd == "vent_open":
+            _log("Vent OPEN", 1)
+        elif cmd == "vent_close":
+            _log("Vent CLOSE", 1)
+        elif cmd == "fan_on":
+            _log("Fan ON", 1)
+        elif cmd == "fan_off":
+            _log("Fan OFF", 1)
+        else:
+            _log("Unknown command: " + cmd, 1)
+    except Exception as e:
+        _log("LXMF handler error: " + str(e), 1)
+
+
+# ---------------------------------------------------------------------------
+# Announce handler
+# ---------------------------------------------------------------------------
+
+def _on_announce(destination_hash, app_data, packet):
+    global _hub_identity
+    if app_data is None:
+        return
+    try:
+        data_str = (
+            app_data.decode("utf-8")
+            if isinstance(app_data, (bytes, bytearray))
+            else str(app_data)
+        )
+        _log("Announce from " + destination_hash.hex()[:8] + ": " + data_str, 2)
+        if _hub_identity is None:
+            ident = Identity.recall(destination_hash)
+            if ident is not None:
+                _hub_identity = ident
+                _log("Hub discovered: " + ident.hexhash)
+    except Exception as e:
+        _log("Announce handler error: " + str(e), 2)
+
+
+# ---------------------------------------------------------------------------
+# Telemetry builder — battery only
+# ---------------------------------------------------------------------------
+
+def _build_telemetry(bat_v, interface_name):
+    t = {
+        "dev_id":        config.NODE_NAME,
+        "device_type":   config.DEVICE_TYPE,
+        "fw_ver":        config.FIRMWARE_VERSION,
+        "gateway_id":    config.NODE_NAME,
+        "rns_interface": interface_name,
+    }
+    if bat_v is not None:
+        t["bat_v"] = bat_v
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Async main
+# ---------------------------------------------------------------------------
+
+async def main():
+    global _hub_identity, _lxm_router
+
+    gc.collect()
+    _log("=" * 40)
+    _log("GW-SUPPORT-01 boot — µReticulum v" + config.FIRMWARE_VERSION)
+    _log("=" * 40)
+
+    # ------------------------------------------------------------------
+    # 1. Initialise µReticulum FIRST — before WiFi.
+    #    RNodeBLEInterface.__init__ calls wlan.active(True) internally
+    #    to generate/load the persistent BLE MAC address. If WiFi is
+    #    already connected at that point, the wlan.active() call
+    #    disrupts it and the interface constructor throws, causing
+    #    setup_interfaces() to silently drop the BLE interface.
+    #    It also reads ble_pin.txt / force_pair.txt / ble_bond.json
+    #    itself — main.py does not need to touch those files.
+    # ------------------------------------------------------------------
+    try:
+        rns = Reticulum(loglevel={0: 0, 1: 0, 2: 2}.get(config.DEBUG, 0))
+        rns.config = config.CONFIG
+        storage = rns.storagepath
+        ident = _find_or_create_identity(storage)
+        rns.identity = ident
+        rns.setup_interfaces()
+        _log("µReticulum initialised — identity: " + ident.hexhash)
+        _log("Interfaces: " + str([str(i) for i in rns.interfaces]))
+    except Exception as e:
+        _log("FATAL: µReticulum init failed: " + str(e))
+        _deep_sleep()
+        return
+
+    # ------------------------------------------------------------------
+    # 2. Connect WiFi now — safe because BLE MAC setup is already done
+    # ------------------------------------------------------------------
+    wifi_interfaces = [
+        i for i in config.CONFIG.get("interfaces", [])
+        if i.get("enabled", True)
+        and i.get("type", "") in ("UDPInterface", "TCPClientInterface")
+    ]
+    if wifi_interfaces and config.WIFI_SSID:
+        try:
+            ip = _connect_wifi(config.WIFI_SSID, config.WIFI_PASS)
+            _log("WiFi connected — IP: " + ip)
+        except Exception as e:
+            _log("WiFi failed: " + str(e))
+
+    # ------------------------------------------------------------------
+    # 3. Start poll loops
+    # ------------------------------------------------------------------
+    from urns.transport import Transport
+
+    poll_tasks = []
+    for iface in rns.interfaces:
+        if hasattr(iface, "poll_loop"):
+            task = asyncio.create_task(iface.poll_loop())
+            poll_tasks.append(task)
+            _log("Started poll loop for " + str(iface))
+
+    transport_task = asyncio.create_task(Transport.job_loop())
+    poll_tasks.append(transport_task)
+    _log("Started transport job loop")
+
+    # ------------------------------------------------------------------
+    # 4. Wait for interface online
+    # ------------------------------------------------------------------
+    _log("Waiting for interface to come online...")
+    iface_timeout  = 45
+    iface_deadline = time.ticks_add(time.ticks_ms(), iface_timeout * 1000)
+
+    while time.ticks_diff(iface_deadline, time.ticks_ms()) > 0:
+        online = [i for i in rns.interfaces if getattr(i, "online", False)]
+        if online:
+            _log("Interface online: " + str(online[0]))
+            break
+        await asyncio.sleep_ms(500)
+    else:
+        _log("WARN: No interface online after " + str(iface_timeout) + "s")
+
+    # ------------------------------------------------------------------
+    # 5. LXMRouter for LXMF receive
+    # ------------------------------------------------------------------
+    _lxm_router = LXMRouter(storagepath=storage)
+    lxmf_dest = _lxm_router.register_delivery_identity(
+        ident, display_name=config.NODE_NAME,
+    )
+    _lxm_router.register_delivery_callback(_on_lxmf_delivery)
+    _log("LXMF delivery dest: " + lxmf_dest.hexhash)
+
+    cmd_dest = Destination(
+        ident, Destination.IN, Destination.SINGLE,
+        config.COMMAND_APP, config.COMMAND_ASPECT,
+    )
+    cmd_dest.set_proof_strategy(Destination.PROVE_ALL)
+    cmd_dest._announce_handler = _on_announce
+
+    # ------------------------------------------------------------------
+    # 6. Read battery + announce
+    # ------------------------------------------------------------------
+    bat_v = _read_battery_v()
+    if bat_v is not None:
+        _log("Battery: {:.2f}V".format(bat_v))
+
+    app_data = (config.RNS_ANNOUNCE_PREFIX + ":" + config.NODE_NAME).encode("utf-8")
+    cmd_dest.announce(app_data=app_data)
+    _log("Announced on " + config.COMMAND_APP + "." + config.COMMAND_ASPECT)
+
+    # ------------------------------------------------------------------
+    # 7. Wait for hub announce (must yield so BLE packets are processed)
+    # ------------------------------------------------------------------
+    _log("Waiting for hub announce...")
+    hub_timeout  = 60
+    hub_deadline = time.ticks_add(time.ticks_ms(), hub_timeout * 1000)
+
+    while _hub_identity is None and time.ticks_diff(hub_deadline, time.ticks_ms()) > 0:
+        await asyncio.sleep_ms(500)
+
+    # ------------------------------------------------------------------
+    # 8. Send telemetry
+    # ------------------------------------------------------------------
+    iface_name = _get_rns_interface_name(rns)
+    payload    = json.dumps(_build_telemetry(bat_v, iface_name)).encode("utf-8")
+
+    if _hub_identity is not None:
+        tx_dest = Destination(
+            _hub_identity, Destination.OUT, Destination.SINGLE,
+            config.TELEMETRY_APP, config.TELEMETRY_ASPECT,
+        )
+        _log("Telemetry -> SINGLE (hub known)")
+    else:
+        _log("WARN: hub not found — sending PLAIN")
+        tx_dest = Destination(
+            None, Destination.OUT, Destination.PLAIN,
+            config.TELEMETRY_APP, config.TELEMETRY_ASPECT,
+        )
+
+    receipt = Packet(tx_dest, payload, Packet.DATA).send()
+    _log("Telemetry " + ("sent" if receipt else "FAILED") +
+         " (" + str(len(payload)) + " bytes)")
+
+    # ------------------------------------------------------------------
+    # 9. Listen for LXMF commands
+    # ------------------------------------------------------------------
+    _log("Listening for commands (5 s)...")
+    await asyncio.sleep_ms(5000)
+
+    # ------------------------------------------------------------------
+    # 10. Clean up + deep sleep
+    # ------------------------------------------------------------------
+    for task in poll_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    for iface in rns.interfaces:
+        if hasattr(iface, "close"):
+            try:
+                iface.close()
+            except Exception:
+                pass
+
+    _deep_sleep()
+
+
+def _deep_sleep():
+    if config.ENABLE_DEEPSLEEP:
+        _log("Deep sleeping {} s...".format(config.SLEEP_INTERVAL_SEC))
+        time.sleep_ms(100)
+        machine.deepsleep(config.SLEEP_INTERVAL_SEC * 1000)
+    else:
+        _log("DEBUG MODE — no deep sleep.")
+        while True:
+            time.sleep(1)
+
+
+asyncio.run(main())

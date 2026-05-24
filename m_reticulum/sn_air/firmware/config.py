@@ -24,8 +24,8 @@ FIRMWARE_VERSION = "2.0.0-mr"  # -mr = microreticulum
 
 # ---- WiFi (for greenhouse/indoor use only) ----
 # Leave blank for field deployment (BLE-only)
-WIFI_SSID = ""
-WIFI_PASS = ""
+WIFI_SSID = "FRITZ!Box 5490 ME"
+WIFI_PASS = "99141440711753817435"
 
 # ---- Deep sleep ----
 ENABLE_DEEPSLEEP = True
@@ -36,7 +36,7 @@ PIN_DHT = 2  # DHT22 data pin
 PIN_BAT_ADC = 1  # Battery voltage divider (100k/100k → GPIO1)
 
 # ---- Battery ----
-HAS_BAT_RESISTORS = True  # 100k/100k divider on board
+HAS_BAT_RESISTORS = False  # 100k/100k divider on board
 BAT_DIVIDER_RATIO = 2.0  # V_bat / V_adc for equal resistors
 
 # ---- DEBUG levels: 0 = silent, 1 = messages, 2 = full ----
@@ -55,7 +55,7 @@ CONFIG = {
     "interfaces": [
         # --- RNode BLE (PRIMARY — connects directly to RNode over BLE) ---
         # RNodeBLEInterface is the primary transport for field deployment.
-        # It connects to a RAK4631 RNode's BLE NUS service using KISS framing.
+        # It connects to a RAK4631 RNode BLE serial.
         # Enable BLE on the RNode with: rnodeconf --bluetooth-on
         {
             "type": "RNodeBLEInterface",
@@ -101,13 +101,13 @@ CONFIG = {
         # },
         # --- WiFi UDP (tertiary — greenhouse/indoor only) ---
         # Uncomment and fill WIFI_SSID/WIFI_PASS above for indoor use:
-        # {
-        #     "type": "UDPInterface",
-        #     "name": "WiFi UDP",
-        #     "enabled": True,
-        #     "listen_port": 4242,
-        #     "forward_port": 4242,
-        # },
+        {
+            "type": "UDPInterface",
+            "name": "WiFi UDP",
+            "enabled": True,
+            "listen_port": 4242,
+            "forward_port": 4242,
+        },
         # --- FUTURE: LoRa via E32 (requires E32-900T20D module wired to ESP32-C6) ---
         # Enable for direct LoRa path to Hub's RNode, bypassing gateway entirely.
         # {
@@ -161,7 +161,7 @@ COMMAND_ASPECT = "gateway_commands"
 RNS_ANNOUNCE_PREFIX = "agronomi-sensor"
 
 # Hub announce app_data filter — only accept announces from hubs
-HUB_ANNOUNCE_FILTER = "AgroNomi Hub"
+HUB_ANNOUNCE_FILTER = "agronomi"
 
 # ---- LXMF address (discovered via announce if empty) ----
 SENSOR_HUB = ""

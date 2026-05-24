@@ -211,8 +211,7 @@ For AgroNomi:
 | Central Hub | ✅ Yes | Stationary, always-on, well-connected. Serves as distributed keystore (caches public keys for the fleet), routes announces between interfaces. |
 | Field Gateway (current: mimi) | ⚠️ Probably yes | Currently the only link between field nodes and hub via LoRa. Needs to rebroadcast hub's announces to reach any future LoRa peers. |
 | Field Gateway (future: 5+ gateways on same LoRa) | ❌ Consider Instance only | With many gateways on the same LoRa frequency, every gateway rebroadcasting every announce wastes airtime. Only 1-2 gateways need to be Transport Nodes on LoRa. |
-| ESP32 sensor/actuator | ❌ No | Not an RNS node — communicates via BLE only. |
-| Pico 2W | ❌ No | Not an RNS node — BLE-to-serial bridge only. |
+| ESP32 sensor/actuator | ❌ No | micoreticulum node — communicates via BLE field rnode. Perhaps local only transport needs to be enabled on microreticulum nodes. |
 
 The key tradeoff: Transport Nodes rebroadcast announces and forward packets for other nodes, which is essential for multi-hop connectivity but consumes bandwidth on slow mediums like LoRa. With only one gateway (mimi), the overhead is minimal. As the fleet scales, designate only the best-connected gateways as Transport Nodes on LoRa.
 
@@ -528,28 +527,25 @@ The current system has one hub and one gateway (mimi). Scaling to multiple field
               ┌──────────────────────┼──────────────────────┐
               │                      │                      │
      ┌────────┴─────────┐  ┌────────┴─────────┐  ┌────────┴─────────┐
-     │  Gateway mimi    │  │  Gateway north   │  │  Gateway south   │
-     │  (HP/Ubuntu)     │  │  (field)        │  │  (field)        │
+     │  RNode LoRa BLE  │  │  RNode LoRa BLE  │  │  RNode LoRa BLE  │
+     │    (field 1)     │  │  (field 2)       │  │  (field 3)       │
      │                  │  │                  │  │                  │
-     │ AutoInterface    │  │ AutoInterface    │  │ AutoInterface    │
-     │ RNode LoRa       │  │ RNode LoRa       │  │ RNode LoRa       │
-     │ TCP→Hub (auto)   │  │ TCP→Hub (auto)   │  │ I2P→Hub (auto)   │
+     │   │     │
      └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
               │                      │                      │
-         ┌────┴────┐           ┌────┴────┐           ┌────┴────┐
-         │Pico 2W  │           │Pico 2W │           │Pico 2W │
-         │BLE hub  │           │BLE hub │           │BLE hub │
-         └────┬────┘           └────┬────┘           └────┬────┘
               │                      │                      │
         ┌─────┴─────┐        ┌───────┴──────┐        ┌───────┴──────┐
-        │ESP32 nodes│        │ESP32 nodes  │        │ESP32 nodes  │
+        │ESP32c6 BLE          ESP32c6 BLE              ESP32c6 BLE  
+        │  nodes    │        │  nodes        │        │  nodes        │
+        │              │        │        │        │        │
+        │           │        │        │        │        │
         └───────────┘        └──────────────┘        └──────────────┘
 ```
 
-Each gateway is an independent RNS Transport Node. Gateways discover the hub via:
+Each esp node can connect via BLE rnode to reticulum network. Nodes discover the hub via:
 1. **AutoInterface** — if on same LAN (zero config, instant)
 2. **LoRa announces** — if on same LoRa frequency (no IP needed)
-3. **Discoverable TCP** — hub publishes its TCP server; gateways auto-connect via `autoconnect_discovered_interfaces`
+3. **Discoverable TCP** — hub publishes its TCP server; nodes auto-connect via `autoconnect_discovered_interfaces`
 4. **I2P tunnel** — if behind strict NAT with no Tailscale (slow but always works)
 5. **Tailscale TCP** — if on a remote network running Tailscale (fast, uses Tailscale CGNAT IP)
 
@@ -572,8 +568,8 @@ If the Network Identity file doesn't exist on a node, RNS will auto-generate one
 #### Hub Auto-Provisioning
 
 The hub is the fleet's central Transport Node. It must:
-- Listen for incoming TCP connections from gateways (discoverable)
-- Listen for LoRa traffic from field gateways
+- Listen for incoming TCP connections from nodes (discoverable)
+- Listen for LoRa traffic from field nodes
 - Accept LAN connections via AutoInterface
 - Proxy path requests on behalf of connected gateways
 
@@ -603,7 +599,7 @@ The hub is the fleet's central Transport Node. It must:
   discoverable = yes
   discovery_name = AgroNomi Hub
   discovery_encrypt = yes
-  reachable_on = /opt/agronomi/bin/get_reachable_ip.sh
+  reachable_on = /bel/CascadeProjects/pod_peripherals/get_reachable_ip.sh
   discovery_stamp_value = 20
   announce_interval = 720
 
@@ -637,12 +633,12 @@ fi
 exit 1
 ```
 
-#### Gateway Auto-Provisioning
+#### Nodes Auto-Provisioning
 
-Gateways are the workhorses — they bridge BLE field nodes to the RNS mesh. They must:
-- Connect to the hub by whatever path is available (AutoInterface, LoRa discovery, TCP auto-connect, I2P)
+BLE field nodes are part of the RNS mesh. They must:
+- Connect to the hub by whatever path is available (LoRa discovery, TCP auto-connect, I2P)
 - Announce themselves so the hub discovers their `farm.gateway_commands` destination
-- Keep LoRa active as the always-on fallback
+- They always have BLE Rnode available.
 
 **`autoconfigure_rns(role="gateway")` generates:**
 
@@ -675,7 +671,7 @@ Gateways are the workhorses — they bridge BLE field nodes to the RNS mesh. The
   txpower = 17
 ```
 
-**No TCPServerInterface on gateways** — they are clients, not servers. The gateway discovers the hub's TCP server via the LoRa-carried discovery announce (or via AutoInterface on LAN), then auto-connects as a TCP client.
+**No TCPServerInterface on field nodes** — they are clients, not servers. The node discovers the hub's TCP server via the LoRa-carried discovery announce (or via AutoInterface on LAN), then auto-connects as a TCP client.
 
 **Gateway auto-connect flow:**
 1. Gateway starts → AutoInterface scans LAN, LoRa comes up
