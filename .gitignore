@@ -18,6 +18,11 @@ gateway.identity
 # --- WiFi credentials (per-device, never commit) ---
 secrets.py
 
+# --- Per-device secrets directory ---
+# Contains placeholder templates (tracked) and real credentials (not tracked).
+# Template files have "YourWiFi" placeholders and are added with: git add -f
+m_reticulum/secrets/*/secrets.py
+
 # --- Python bytecode ---
 __pycache__/
 *.pyc
@@ -54,8 +59,8 @@ Thumbs.db
 # --- Sensor test/dev data ---
 test_pipeline/test_farm.db*
 
-# --- OTA firmware cache (runtime) ---
-fw_cache/
+# --- Deploy script cache (downloaded firmware releases) ---
+agronomi-firmware/
 .gitnexus
 .claude/skills/gitnexus/
 AGENTS.md
