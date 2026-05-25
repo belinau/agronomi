@@ -35,53 +35,15 @@ All communication uses LXMF (encrypted messaging over Reticulum mesh). No JSON, 
 
 ## How data flows
 
-```
-  Sensor wakes up
-       │
-       ├─→ Announces itself on farm.gateway_commands
-       │
-       ├─→ Hears hub's announce, discovers hub identity
-       │
-       ├─→ Sends telemetry via LXMF fields:
-       │      {dev_id, type, fw, bat, temp, hum, if}
-       │
-       ├─→ Listens for commands for 5 seconds
-       │
-       └─→ Deep sleeps
-```
+![Field pod detail — sensor to hub packet path](documents/agronomi_field_pod_detail.svg)
 
-```
-  Actuator (always on)
-       │
-       ├─→ Announces periodically (every 5 min)
-       │
-       ├─→ Sends telemetry periodically (every 60 sec):
-       │      {dev_id, type, fw, pump_on, bat, if}
-       │
-       └─→ Receives commands instantly via LXMF:
-              {cmd: "pump_on", cmd_id: 42}
-              Sends ACK back:
-              {ack: true, cmd_id: 42, cmd: "pump_on", status: "ok"}
-```
+**Sensor nodes** wake up, announce themselves on `farm.gateway_commands`, discover the hub, send telemetry via LXMF fields (`dev_id`, `type`, `fw`, `bat`, `temp`, `hum`, `if`), listen for commands for 5 seconds, then deep sleep.
+
+**Actuator nodes** stay awake permanently — they announce every 5 min, send telemetry every 60 sec, and receive commands instantly via LXMF. Every command gets an ACK: `{ack: true, cmd_id: 42, cmd: "pump_on", status: "ok"}`.
 
 ## Network topology
 
-```
-                        ┌──────────────────┐
-                        │   Mac Mini Hub    │
-                        │ reticulum_ingest  │
-                        │  (full RNS+LXMF)  │
-                        └──┬────┬────┬──────┘
-                           │    │    │
-                     LoRa RNode  │   WiFi UDP
-                        │    │    │
-            ┌───────────┘    │    └─────────────┐
-            │                │                  │
-       ┌────┴─────┐    ┌────┴─────┐     ┌─────┴──────┐
-       │ SN-AIR   │    │SN-SOIL   │     │AN-GREENHOUSE│
-       │ SN-SUPP   │    │          │     │AN-PUMP      │
-       └──────────┘    └──────────┘     └─────────────┘
-```
+![AgroNomi mesh overview](documents/agronomi_mesh_overview.svg)
 
 Nodes connect via **BLE to RNode** (LoRa) as primary transport, with **WiFi UDP** as secondary for indoor/greenhouse deployments. The hub runs all interfaces simultaneously.
 
