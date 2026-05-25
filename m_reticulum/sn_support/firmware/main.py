@@ -16,7 +16,6 @@ Lifecycle:
 """
 
 import gc
-import json
 import time
 
 import config
@@ -33,6 +32,7 @@ from urns.packet import Packet
 # ---------------------------------------------------------------------------
 
 _hub_identity = None
+_hub_lxmf_hash = None
 _lxm_router = None
 
 
@@ -110,12 +110,8 @@ def _read_battery_v():
 
 def _on_lxmf_delivery(message):
     try:
-        if isinstance(message.content, (bytes, bytearray)):
-            payload_str = message.content.decode("utf-8")
-        else:
-            payload_str = str(message.content)
-        payload = json.loads(payload_str)
-        cmd = payload.get("cmd", "")
+        fields = message.fields or {}
+        cmd = fields.get("cmd", "")
         _log("LXMF command: " + cmd, 1)
         if cmd == "vent_open":
             _log("Vent OPEN", 1)
@@ -137,7 +133,7 @@ def _on_lxmf_delivery(message):
 
 
 def _on_announce(destination_hash, app_data, packet):
-    global _hub_identity
+    global _hub_identity, _hub_lxmf_hash
     if app_data is None:
         return
     try:
@@ -151,6 +147,8 @@ def _on_announce(destination_hash, app_data, packet):
             ident = Identity.recall(destination_hash)
             if ident is not None:
                 _hub_identity = ident
+                _hub_lxmf_hash = Destination.hash(ident, "lxmf", "delivery")
+                Identity.remember(None, _hub_lxmf_hash, ident.get_public_key())
                 _log("Hub discovered: " + ident.hexhash)
     except Exception as e:
         _log("Announce handler error: " + str(e), 2)
@@ -161,17 +159,17 @@ def _on_announce(destination_hash, app_data, packet):
 # ---------------------------------------------------------------------------
 
 
-def _build_telemetry(bat_v, interface_name):
-    t = {
+def _build_telemetry_fields(bat_v, interface_name):
+    """Build LXMF fields dict for telemetry delivery."""
+    fields = {
         "dev_id": config.NODE_NAME,
-        "device_type": config.DEVICE_TYPE,
-        "fw_ver": config.FIRMWARE_VERSION,
-        "gateway_id": config.NODE_NAME,
-        "rns_interface": interface_name,
+        "type": config.DEVICE_TYPE,
+        "fw": config.FIRMWARE_VERSION,
+        "if": interface_name,
     }
     if bat_v is not None:
-        t["bat_v"] = bat_v
-    return t
+        fields["bat"] = bat_v
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +178,7 @@ def _build_telemetry(bat_v, interface_name):
 
 
 async def main():
-    global _hub_identity, _lxm_router
+    global _hub_identity, _hub_lxmf_hash, _lxm_router
 
     gc.collect()
     _log("=" * 40)
@@ -298,15 +296,11 @@ async def main():
     # 8. Send telemetry via LXMF
     # ------------------------------------------------------------------
     iface_name = _get_rns_interface_name(rns)
-    payload = json.dumps(_build_telemetry(bat_v, iface_name)).encode("utf-8")
 
-    if _hub_identity is not None:
-        tx_dest = Destination(
-            _hub_identity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery"
-        )
-        lxm = LXMessage(tx_dest, lxmf_dest, payload)
-        _lxm_router.handle_outbound(lxm)
-        _log("Telemetry routed via LXMF to Hub: " + _hub_identity.hexhash)
+    if _hub_lxmf_hash is not None:
+        telemetry_fields = _build_telemetry_fields(bat_v, iface_name)
+        _lxm_router.send_message(_hub_lxmf_hash, content=b"", fields=telemetry_fields)
+        _log("Telemetry routed via LXMF fields to Hub: " + _hub_identity.hexhash)
     else:
         _log(
             "WARN: hub not found — skipping telemetry (LXMF requires recipient identity)"

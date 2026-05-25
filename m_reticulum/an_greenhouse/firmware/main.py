@@ -1,66 +1,46 @@
 """µReticulum — Greenhouse Actuator Node Firmware (AN-GREENHOUSE-01)
 
 MicroPython firmware for a greenhouse actuator node (vent, shade, fan)
-that communicates over µReticulum (LoRa / WiFi / BLE).
+that communicates over µReticulum via LXMF.
 
 Unlike sensor nodes that deep-sleep between readings, actuator nodes stay
-awake continuously so they can receive commands at any time.  The main loop
-is an asyncio event loop that keeps all interfaces alive and listening.
+awake continuously so they can receive commands at any time.
 
-Architecture:
-  - IN destination:  farm.gateway_commands (SINGLE) — receives commands
-  - OUT destination:  farm.telemetry_readings — sends periodic status
-  - OUT destination:  farm.commands_control — sends command ACKs
+All telemetry and ACKs are sent via LXMF fields to the hub's lxmf.delivery
+destination — no separate ACK or telemetry destinations needed.
 
-Commands received on the IN destination:
+Commands received via LXMF:
   - vent_open   → open ventilation relay
   - vent_close  → close ventilation relay
-  - shade_pct   → set shade percentage (0–100), payload: {"cmd": "shade_pct", "value": 50}
+  - shade_pct   → set shade percentage (0–100), fields: {"cmd": "shade_pct", "value": 50}
   - fan_on      → turn on circulation fan
   - fan_off     → turn off circulation fan
-
-ACK format (sent to farm.commands_control):
-  {
-    "cmd_id": 123,
-    "device_id": "AN-GREENHOUSE-01",
-    "status": "acknowledged",
-    "error": null
-  }
 """
 
 import gc
-import json
 import time
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 import config
 import machine
-
-# ---------------------------------------------------------------------------
-# Sensor drivers (battery only)
-# ---------------------------------------------------------------------------
+import uasyncio as asyncio
 from sensors import read_all
-
-# ---------------------------------------------------------------------------
-# µReticulum
-# ---------------------------------------------------------------------------
 from urns import Reticulum
 from urns.destination import Destination
 from urns.identity import Identity
+from urns.lxmf import LXMessage, LXMRouter
 from urns.packet import Packet
 
 # ---------------------------------------------------------------------------
 # Module state
 # ---------------------------------------------------------------------------
-_vent_open = False  # Vent relay state
-_shade_pct = 0  # Shade percentage (0–100)
-_fan_on = False  # Fan relay state
-_cmd_counter = 0  # Auto-increment for command tracking
+_vent_open = False
+_shade_pct = 0
+_fan_on = False
+_cmd_counter = 0
 
-# Hub identity — discovered via RNS announce
 _hub_identity = None
+_hub_lxmf_hash = None
+_lxm_router = None
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +49,11 @@ _hub_identity = None
 
 
 def _log(msg, level=1):
-    """Simple level-gated logger."""
     if config.DEBUG >= level:
         print("[AN-GH] " + str(msg))
 
 
 def _get_rns_interface_name(rns):
-    """Return a human-readable name for the first active interface, or 'none'."""
     for iface in rns.interfaces:
         if hasattr(iface, "online") and iface.online:
             return getattr(iface, "name", iface.__class__.__name__).lower()
@@ -83,7 +61,6 @@ def _get_rns_interface_name(rns):
 
 
 def _connect_wifi(ssid, password, timeout=15):
-    """Connect to WiFi. Returns IP address string or raises RuntimeError."""
     import network
 
     wlan = network.WLAN(network.STA_IF)
@@ -102,7 +79,6 @@ def _connect_wifi(ssid, password, timeout=15):
 
 
 def _find_or_create_identity(storage_path):
-    """Load a persisted RNS identity or create a new one."""
     Identity.storagepath = storage_path
     identity_path = storage_path + "/identity"
     try:
@@ -125,15 +101,12 @@ def _find_or_create_identity(storage_path):
 # Actuator control — vent, shade, fan
 # ---------------------------------------------------------------------------
 
-# Initialise GPIO pins (all active-HIGH relays)
 _vent_pin = machine.Pin(config.PIN_VENT_RELAY, machine.Pin.OUT, value=0)
 _fan_pin = machine.Pin(config.PIN_FAN_RELAY, machine.Pin.OUT, value=0)
-# Shade uses PWM on PIN_SHADE_PWM (0–100% duty cycle)
 _shade_pwm = machine.PWM(machine.Pin(config.PIN_SHADE_PWM), freq=25000, duty=0)
 
 
 def vent_open():
-    """Open the ventilation relay."""
     global _vent_open
     _vent_pin.value(1)
     _vent_open = True
@@ -141,7 +114,6 @@ def vent_open():
 
 
 def vent_close():
-    """Close the ventilation relay."""
     global _vent_open
     _vent_pin.value(0)
     _vent_open = False
@@ -149,20 +121,14 @@ def vent_close():
 
 
 def shade_pct(value):
-    """Set shade position to the given percentage (0–100).
-
-    Args:
-        value: Integer 0–100. 0 = fully retracted, 100 = fully extended.
-    """
     global _shade_pct
     value = max(0, min(100, int(value)))
-    _shade_pwm.duty(int(value * 10.23))  # 0–100% → 0–1023 duty
+    _shade_pwm.duty(int(value * 10.23))
     _shade_pct = value
     _log("Shade set to {}%".format(value))
 
 
 def fan_on():
-    """Turn on the circulation fan relay."""
     global _fan_on
     _fan_pin.value(1)
     _fan_on = True
@@ -170,7 +136,6 @@ def fan_on():
 
 
 def fan_off():
-    """Turn off the circulation fan relay."""
     global _fan_on
     _fan_pin.value(0)
     _fan_on = False
@@ -178,137 +143,68 @@ def fan_off():
 
 
 # ---------------------------------------------------------------------------
-# ACK sender — replies to hub via farm.commands_control
+# LXMF command handler
 # ---------------------------------------------------------------------------
 
 
-def _send_ack(cmd, cmd_id, rns, error=None):
-    """Send a JSON ACK packet back to the hub via farm.commands_control.
-
-    The ACK is sent to the hub's SINGLE destination.  If we have
-    discovered the hub's identity via announce, we use an encrypted
-    SINGLE OUT destination.  Otherwise we fall back to PLAIN.
-    """
-    global _hub_identity
-
-    ack_payload = json.dumps(
-        {
-            "cmd_id": cmd_id,
-            "device_id": config.NODE_NAME,
-            "status": "acknowledged" if error is None else "error",
-            "error": error,
-        }
-    ).encode("utf-8")
-
-    try:
-        if _hub_identity is not None:
-            ack_dest = Destination(
-                _hub_identity,
-                Destination.OUT,
-                Destination.SINGLE,
-                config.ACK_APP,
-                config.ACK_ASPECT,
-            )
-        else:
-            ack_dest = Destination(
-                None,
-                Destination.OUT,
-                Destination.PLAIN,
-                config.ACK_APP,
-                config.ACK_ASPECT,
-            )
-
-        pkt = Packet(ack_dest, ack_payload, Packet.DATA)
-        receipt = pkt.send()
-        if receipt:
-            _log(
-                "ACK sent for cmd_id={} status={}".format(
-                    cmd_id, "acknowledged" if error is None else "error"
-                )
-            )
-        else:
-            _log("ACK send FAILED (no interface online?)", 1)
-
-    except Exception as e:
-        _log("ACK send error: " + str(e), 1)
-
-
-# ---------------------------------------------------------------------------
-# Command handler — receives commands on the IN destination
-# ---------------------------------------------------------------------------
-
-
-def _on_command(data, packet):
-    """Handle an inbound command packet on farm.gateway_commands.
-
-    Expected JSON payloads:
-        {"cmd": "vent_open",  "cmd_id": 123}
-        {"cmd": "vent_close", "cmd_id": 124}
-        {"cmd": "shade_pct",  "cmd_id": 125, "value": 50}
-        {"cmd": "fan_on",     "cmd_id": 126}
-        {"cmd": "fan_off",    "cmd_id": 127}
-    """
+def _on_lxmf_delivery(message):
     global _cmd_counter
-
     try:
-        payload = json.loads(
-            data.decode("utf-8") if isinstance(data, (bytes, bytearray)) else str(data)
-        )
+        fields = message.fields or {}
+        cmd = fields.get("cmd", "")
+
+        cmd_id = fields.get("cmd_id", _cmd_counter)
+        _cmd_counter += 1
+        _log("LXMF command: " + cmd + " (cmd_id=" + str(cmd_id) + ")", 1)
+
+        error = None
+
+        if cmd == "vent_open":
+            vent_open()
+        elif cmd == "vent_close":
+            vent_close()
+        elif cmd == "shade_pct":
+            value = fields.get("value", 0)
+            try:
+                shade_pct(int(value))
+            except (ValueError, TypeError) as e:
+                error = "invalid_shade_value: " + str(value)
+                _log("Shade value error: " + str(e), 1)
+        elif cmd == "fan_on":
+            fan_on()
+        elif cmd == "fan_off":
+            fan_off()
+        else:
+            error = "unknown_command: " + cmd
+            _log("Unknown command: " + cmd, 1)
+
+        # ACK via LXMF fields
+        if _hub_lxmf_hash is not None:
+            ack_fields = {
+                "dev_id": config.NODE_NAME,
+                "ack": True,
+                "cmd_id": cmd_id,
+                "cmd": cmd,
+                "status": "ok" if error is None else "error",
+            }
+            if error:
+                ack_fields["error"] = error
+            _lxm_router.send_message(_hub_lxmf_hash, content=b"", fields=ack_fields)
+            _log("ACK sent for cmd_id=" + str(cmd_id))
+
     except Exception as e:
-        _log("Command parse error: " + str(e), 1)
-        return
-
-    cmd = payload.get("cmd", "")
-    cmd_id = payload.get("cmd_id", _cmd_counter)
-    _cmd_counter += 1
-
-    _log("Command received: " + cmd + " (cmd_id=" + str(cmd_id) + ")", 1)
-
-    error = None
-
-    if cmd == "vent_open":
-        vent_open()
-    elif cmd == "vent_close":
-        vent_close()
-    elif cmd == "shade_pct":
-        value = payload.get("value", 0)
-        try:
-            shade_pct(int(value))
-        except (ValueError, TypeError) as e:
-            error = "invalid_shade_value: " + str(value)
-            _log("Shade value error: " + str(e), 1)
-    elif cmd == "fan_on":
-        fan_on()
-    elif cmd == "fan_off":
-        fan_off()
-    else:
-        error = "unknown_command: " + cmd
-        _log("Unknown command: " + cmd, 1)
-
-    # Send ACK back to hub
-    _send_ack(cmd, cmd_id, _rns, error=error)
-
-
-# Reference to the Reticulum instance (set in main)
-_rns = None
+        _log("LXMF handler error: " + str(e), 1)
 
 
 # ---------------------------------------------------------------------------
-# Announce handler — discovers the hub on the command channel
+# Announce handler — discovers the hub and seeds destination hashes
 # ---------------------------------------------------------------------------
 
 
 def _on_announce(destination_hash, app_data, packet):
-    """Callback when an announce is received.
-
-    If the app_data contains a known hub identifier
-    prefix, we record the identity so we can send telemetry and ACKs
-    to it using encrypted SINGLE destinations.
-    """
-    global _hub_identity
+    global _hub_identity, _hub_lxmf_hash
     if app_data is None:
         return
-
     try:
         data_str = (
             app_data.decode("utf-8")
@@ -316,39 +212,35 @@ def _on_announce(destination_hash, app_data, packet):
             else str(app_data)
         )
         _log("Announce from " + destination_hash.hex()[:8] + ": " + data_str, 2)
-
-        # Accept any announce on the command channel as a potential hub
         if _hub_identity is None:
             ident = Identity.recall(destination_hash)
             if ident is not None:
                 _hub_identity = ident
+                _hub_lxmf_hash = Destination.hash(ident, "lxmf", "delivery")
+                Identity.remember(None, _hub_lxmf_hash, ident.get_public_key())
                 _log("Hub discovered: " + ident.hexhash)
-
     except Exception as e:
         _log("Announce handler error: " + str(e), 2)
 
 
 # ---------------------------------------------------------------------------
-# Status telemetry builder
+# Telemetry builder — flat LXMF fields dict
 # ---------------------------------------------------------------------------
 
 
-def _build_status_telemetry(interface_name):
-    """Build a JSON telemetry dict with actuator states and battery voltage."""
+def _build_telemetry_fields(interface_name):
     readings = read_all(config)
-    return {
+    fields = {
         "dev_id": config.NODE_NAME,
-        "device_type": config.DEVICE_TYPE,
-        "fw_ver": config.FIRMWARE_VERSION,
-        "gateway_id": config.NODE_NAME,
-        "readings": {
-            "vent_open": _vent_open,
-            "shade_pct": _shade_pct,
-            "fan_on": _fan_on,
-        },
-        "bat_v": readings.get("battery_v", -1.0),
-        "rns_interface": interface_name,
+        "type": config.DEVICE_TYPE,
+        "fw": config.FIRMWARE_VERSION,
+        "vent_open": _vent_open,
+        "shade_pct": _shade_pct,
+        "fan_on": _fan_on,
+        "bat": readings.get("battery_v", -1.0),
+        "if": interface_name,
     }
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -357,12 +249,7 @@ def _build_status_telemetry(interface_name):
 
 
 def main():
-    """Greenhouse actuator main — runs an async event loop continuously.
-
-    Unlike sensor nodes, actuator nodes never deep-sleep. They stay
-    awake to receive commands at any time via the RNS event loop.
-    """
-    global _rns, _hub_identity
+    global _hub_identity, _hub_lxmf_hash, _lxm_router
 
     gc.collect()
     _log("=" * 40)
@@ -391,107 +278,92 @@ def main():
     try:
         rns = Reticulum(loglevel={0: 0, 1: 0, 2: 2}.get(config.DEBUG, 0))
         rns.config = config.CONFIG
-
         storage = rns.storagepath
         ident = _find_or_create_identity(storage)
         rns.identity = ident
-
         rns.setup_interfaces()
-        _rns = rns
-
         _log("µReticulum initialised — identity: " + ident.hexhash)
-
     except Exception as e:
         _log("FATAL: µReticulum init failed: " + str(e))
-        # Cannot operate without RNS — reboot after a delay
         time.sleep(10)
         machine.reset()
         return
 
     # ------------------------------------------------------------------
-    # 3. Set up RNS destinations
+    # 3. Set up LXMRouter for LXMF receive + command destination
     # ------------------------------------------------------------------
+    _lxm_router = LXMRouter(storagepath=storage)
+    lxmf_dest = _lxm_router.register_delivery_identity(
+        ident,
+        display_name=config.NODE_NAME,
+    )
+    _lxm_router.register_delivery_callback(_on_lxmf_delivery)
+    _log("LXMF delivery dest: " + lxmf_dest.hexhash)
 
-    # IN: farm.gateway_commands — receive commands from the hub (SINGLE, announceable)
     cmd_dest = Destination(
         ident,
         Destination.IN,
         Destination.SINGLE,
-        config.COMMAND_IN_APP,
-        config.COMMAND_IN_ASPECT,
+        config.COMMAND_APP,
+        config.COMMAND_ASPECT,
     )
     cmd_dest.set_proof_strategy(Destination.PROVE_ALL)
-    cmd_dest.set_packet_callback(_on_command)
     cmd_dest._announce_handler = _on_announce
 
-    _log("Command IN dest: " + str(cmd_dest))
+    # ------------------------------------------------------------------
+    # 4. Start poll loops + announce
+    # ------------------------------------------------------------------
+    from urns.transport import Transport
 
-    # ------------------------------------------------------------------
-    # 4. Announce ourselves so the hub can discover us
-    # ------------------------------------------------------------------
+    poll_tasks = []
+    for iface in rns.interfaces:
+        if hasattr(iface, "poll_loop"):
+            task = asyncio.create_task(iface.poll_loop())
+            poll_tasks.append(task)
+            _log("Started poll loop for " + str(iface))
+
+    transport_task = asyncio.create_task(Transport.job_loop())
+    poll_tasks.append(transport_task)
+    _log("Started transport job loop")
+
     app_data = (config.RNS_ANNOUNCE_PREFIX + ":" + config.NODE_NAME).encode("utf-8")
     cmd_dest.announce(app_data=app_data)
-    _log("Announced on " + config.COMMAND_IN_APP + "." + config.COMMAND_IN_ASPECT)
+    _log("Announced on " + config.COMMAND_APP + "." + config.COMMAND_ASPECT)
 
     # ------------------------------------------------------------------
     # 5. Run the async event loop (blocks forever)
     # ------------------------------------------------------------------
-    import uasyncio as asyncio
-
-    # Periodic tasks
     async def periodic_announce():
-        """Re-announce periodically so new/refreshed hubs can discover us."""
         while True:
             await asyncio.sleep(config.ANNOUNCE_INTERVAL_SEC)
             try:
                 cmd_dest.announce(app_data=app_data)
                 _log(
                     "Re-announced on "
-                    + config.COMMAND_IN_APP
+                    + config.COMMAND_APP
                     + "."
-                    + config.COMMAND_IN_ASPECT
+                    + config.COMMAND_ASPECT
                 )
             except Exception as e:
                 _log("Re-announce error: " + str(e), 1)
 
     async def periodic_telemetry():
-        """Send periodic status telemetry to the hub."""
         while True:
             await asyncio.sleep(config.TELEMETRY_INTERVAL_SEC)
             try:
-                iface_name = _get_rns_interface_name(rns)
-                telemetry = _build_status_telemetry(iface_name)
-                payload = json.dumps(telemetry).encode("utf-8")
-
-                # Send to the hub's telemetry destination
-                if _hub_identity is not None:
-                    tx_dest = Destination(
-                        _hub_identity,
-                        Destination.OUT,
-                        Destination.SINGLE,
-                        config.TELEMETRY_APP,
-                        config.TELEMETRY_ASPECT,
+                if _hub_lxmf_hash is not None:
+                    iface_name = _get_rns_interface_name(rns)
+                    telemetry_fields = _build_telemetry_fields(iface_name)
+                    _lxm_router.send_message(
+                        _hub_lxmf_hash, content=b"", fields=telemetry_fields
                     )
+                    _log("Telemetry sent via LXMF fields")
                 else:
-                    tx_dest = Destination(
-                        None,
-                        Destination.OUT,
-                        Destination.PLAIN,
-                        config.TELEMETRY_APP,
-                        config.TELEMETRY_ASPECT,
-                    )
-
-                pkt = Packet(tx_dest, payload, Packet.DATA)
-                receipt = pkt.send()
-                if receipt:
-                    _log("Status telemetry sent (" + str(len(payload)) + " bytes)")
-                else:
-                    _log("Status telemetry send FAILED", 1)
+                    _log("No hub — skipping telemetry", 1)
             except Exception as e:
                 _log("Telemetry error: " + str(e), 1)
 
     async def keep_alive():
-        """Minimum-viable keep-alive so the event loop never exits."""
         while True:
             await asyncio.sleep(60)
 
@@ -507,12 +379,8 @@ def main():
         rns.shutdown()
     except Exception as e:
         _log("Event loop error: " + str(e), 1)
-        # Critical failure — reboot after a delay
         time.sleep(10)
         machine.reset()
 
 
-# ---------------------------------------------------------------------------
-# Auto-run on import (MicroPython entry point)
-# ---------------------------------------------------------------------------
 main()

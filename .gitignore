@@ -15,6 +15,9 @@
 farm_hub.identity
 gateway.identity
 
+# --- WiFi credentials (per-device, never commit) ---
+secrets.py
+
 # --- Python bytecode ---
 __pycache__/
 *.pyc

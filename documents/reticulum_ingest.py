@@ -133,7 +133,7 @@ class OutboundCommandDispatcher:
 
                     if not dest_hex or dest_hex == "unknown":
                         RNS.log(
-                            f"[COMMAND REJECT] Missing path to {dev_id}.",
+                            f"[COMMAND REJECT] Missing destination reference to {dev_id}.",
                             RNS.LOG_WARNING,
                         )
                         continue
@@ -154,7 +154,7 @@ class OutboundCommandDispatcher:
                         )
                         continue
 
-                    # Construct a proper RNS.Destination object as expected by the LXMessage constructor
+                    # Standard Python RNS Destination object used for LXMessage
                     dest = RNS.Destination(
                         recipient_identity,
                         RNS.Destination.OUT,
@@ -194,8 +194,6 @@ class OutboundCommandDispatcher:
 # ---------------------------------------------------------------------------
 # GLOBAL ANNOUNCE HANDLER (Hub Side Discovery Layer)
 # ---------------------------------------------------------------------------
-# This handler receives announcements on your custom aspect and registers
-# the nodes' public keys into Reticulum's identity cache natively
 class NodeDiscoveryHandler:
     def __init__(self, aspect_filter):
         self.aspect_filter = aspect_filter
@@ -209,9 +207,81 @@ class NodeDiscoveryHandler:
                 if isinstance(app_data, (bytes, bytearray))
                 else str(app_data)
             )
-            # Logs peer discovery natively at notice level
+
+            identity_hex = announced_identity.hash.hex()
             RNS.log(
-                f"[DISCOVERY] Learned identity for node: {RNS.prettyhexrep(destination_hash)} | Metadata: {data_str}",
+                f"[DISCOVERY] Learned identity for node: {RNS.prettyhexrep(announced_identity.hash)} | Metadata: {data_str}",
+                RNS.LOG_NOTICE,
+            )
+
+            # Derive the node's lxmf.delivery destination hash
+            lxmf_delivery_hash = RNS.Destination.hash_from_name_and_identity(
+                "lxmf.delivery", announced_identity
+            )
+
+            # NATIVE SEEDING: Explicitly register the public key mapping to the node's lxmf.delivery hash
+            # This allows Reticulum's transport layer to verify signatures on incoming telemetry packets
+            RNS.Identity.remember(
+                None,
+                lxmf_delivery_hash,
+                announced_identity.get_public_key(),
+            )
+            RNS.log(
+                f"[DISCOVERY] Pre-registered lxmf.delivery hash {RNS.prettyhexrep(lxmf_delivery_hash)} for {data_str}",
+                RNS.LOG_NOTICE,
+            )
+
+            # Extract dynamic node ID (e.g., agronomi-sensor:SN-AIR-01 -> SN-AIR-01)
+            node_id = (
+                data_str.split(":")[-1].strip() if ":" in data_str else data_str.strip()
+            )
+            now_str = datetime.now().isoformat()
+
+            # Record discovery and true destination hash to database
+            conn = get_db()
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO sensor_nodes (node_id, name, last_seen)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(node_id) DO UPDATE SET
+                        last_seen = excluded.last_seen
+                """,
+                    (node_id, node_id, now_str),
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO hardware_devices (
+                        device_id,
+                        device_type,
+                        node_id,
+                        rns_identity_hash,
+                        rns_destination_hash,
+                        rns_interface,
+                        firmware_version,
+                        last_seen
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(device_id) DO UPDATE SET
+                        rns_identity_hash = excluded.rns_identity_hash,
+                        rns_destination_hash = excluded.rns_destination_hash,
+                        rns_interface = excluded.rns_interface,
+                        last_seen = excluded.last_seen
+                """,
+                    (
+                        node_id,
+                        "support_node" if "GW" not in node_id else "gateway",
+                        node_id,
+                        identity_hex,
+                        lxmf_delivery_hash.hex(),  # Store the exact lxmf.delivery destination hash
+                        "unknown",
+                        None,
+                        now_str,
+                    ),
+                )
+            RNS.log(
+                f"[DISCOVERY DB] Successfully registered hardware device path for {node_id}",
                 RNS.LOG_NOTICE,
             )
         except Exception as e:
@@ -245,6 +315,7 @@ class FarmLXMFHub:
         # VERIFIED API METHOD SIGNATURE
         self.lxm_router.register_delivery_callback(self._on_lxm_received)
 
+        # Raw Identity Hash target display exactly as original working script
         self.hub_addr_hex = RNS.prettyhexrep(self.identity.hash)
         display_string = f"<Hub> {self.hub_addr_hex}"
 
@@ -300,23 +371,8 @@ class FarmLXMFHub:
 
     def _on_lxm_received(self, lxm_message):
         """Callback executed by LXMRouter when a verified LXM message is delivered."""
-        # FAILSAFE DIAGNOSTIC LOG (Bypasses all routing, DB, and JSON parsing checks)
-        RNS.log("[DEBUG HUB] _on_lxm_received callback triggered!", RNS.LOG_ERROR)
         try:
-            # Standard LXMF: Read the msgpacked fields dictionary natively (bypasses JSON entirely)
             fields = lxm_message.fields
-
-            # Robust fallback to support legacy JSON in message content if needed
-            if not fields and lxm_message.content:
-                try:
-                    raw_payload = lxm_message.content_as_string()
-                    if "{" in raw_payload:
-                        raw_payload = raw_payload[
-                            raw_payload.find("{") : raw_payload.rfind("}") + 1
-                        ]
-                    fields = json.loads(raw_payload)
-                except Exception:
-                    pass
 
             if fields and "dev_id" in fields:
                 src_hex = lxm_message.source_hash.hex()
@@ -326,9 +382,7 @@ class FarmLXMFHub:
                 )
                 self._write_telemetry_to_db(fields, src_hex)
         except Exception as e:
-            RNS.log(
-                f"[DROP] Failed parsing incoming LXM frame payload: {e}", RNS.LOG_ERROR
-            )
+            RNS.log(f"[DROP] Failed parsing incoming LXM fields: {e}", RNS.LOG_ERROR)
 
     def _write_telemetry_to_db(self, data, source_hex: str):
         now_str = datetime.now().isoformat()
@@ -368,6 +422,7 @@ class FarmLXMFHub:
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(device_id) DO UPDATE SET
+                        rns_identity_hash = excluded.rns_identity_hash,
                         rns_destination_hash = excluded.rns_destination_hash,
                         rns_interface = excluded.rns_interface,
                         last_seen = excluded.last_seen

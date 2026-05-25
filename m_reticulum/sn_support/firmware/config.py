@@ -6,20 +6,30 @@ Sensors: battery ADC only
 """
 
 # ---- Node identity ----
-NODE_NAME        = "GW-SUPPORT-01"
-DEVICE_TYPE      = "support_node"
+NODE_NAME = "GW-SUPPORT-01"
+DEVICE_TYPE = "support_node"
 FIRMWARE_VERSION = "2.0.0-mr"
 
 # ---- WiFi ----
-WIFI_SSID = "FRITZ!Box 5490 ME"
-WIFI_PASS = "99141440711753817435"
+# Credentials are loaded from secrets.py (not tracked by git).
+# If secrets.py is missing, WiFi is disabled (BLE-only mode).
+WIFI_SSID = ""
+WIFI_PASS = ""
+try:
+    from secrets import WIFI_PASS as _pass
+    from secrets import WIFI_SSID as _ssid
+
+    WIFI_SSID = _ssid
+    WIFI_PASS = _pass
+except ImportError:
+    pass
 
 # ---- Deep sleep ----
-ENABLE_DEEPSLEEP   = False   # True for production
+ENABLE_DEEPSLEEP = False  # True for production
 SLEEP_INTERVAL_SEC = 300
 
 # ---- Battery ADC (ESP32-C6 Super Mini, 100k/100k divider) ----
-BAT_ADC_PIN       = 1
+BAT_ADC_PIN = 1
 BAT_DIVIDER_RATIO = 2.0
 
 # ---- Logging: 0=silent 1=info 2=debug ----
@@ -33,32 +43,32 @@ CONFIG = {
     "enable_transport": False,
     "interfaces": [
         {
-            "type":            "RNodeBLEInterface",
-            "name":            "RNode BLE",
-            "target_name":     "",       # auto-discover by NUS UUID
-            "pairing_passkey": 0,        # overwritten from ble_pin.txt at boot
-            "frequency":       868000000,
-            "bandwidth":       125000,
+            "type": "RNodeBLEInterface",
+            "name": "RNode BLE",
+            "target_name": "",  # auto-discover by NUS UUID
+            "pairing_passkey": 0,  # overwritten from ble_pin.txt at boot
+            "frequency": 868000000,
+            "bandwidth": 125000,
             "spreadingfactor": 11,
-            "codingrate":      5,
-            "txpower":         17,
-            "enabled":         True,
+            "codingrate": 5,
+            "txpower": 17,
+            "enabled": True,
         },
         {
-            "type":         "UDPInterface",
-            "name":         "WiFi UDP",
-            "listen_port":  4242,
+            "type": "UDPInterface",
+            "name": "WiFi UDP",
+            "listen_port": 4242,
             "forward_port": 4242,
-            "enabled":      True,
+            "enabled": True,
         },
     ],
 }
 
 # ---- Hub destinations ----
-TELEMETRY_APP    = "farm"
+TELEMETRY_APP = "farm"
 TELEMETRY_ASPECT = "telemetry_readings"
-COMMAND_APP      = "farm"
-COMMAND_ASPECT   = "gateway_commands"
+COMMAND_APP = "farm"
+COMMAND_ASPECT = "gateway_commands"
 
 # ---- Announce ----
 RNS_ANNOUNCE_PREFIX = "agronomi-sensor"

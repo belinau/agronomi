@@ -16,7 +16,6 @@ Lifecycle:
 """
 
 import gc
-import json
 import time
 
 import config
@@ -34,6 +33,7 @@ from urns.packet import Packet
 # ---------------------------------------------------------------------------
 
 _hub_identity = None
+_hub_lxmf_hash = None
 _lxm_router = None
 
 
@@ -98,19 +98,14 @@ def _find_or_create_identity(storage_path):
 
 def _on_lxmf_delivery(message):
     try:
-        if isinstance(message.content, (bytes, bytearray)):
-            payload_str = message.content.decode("utf-8")
-        else:
-            payload_str = str(message.content)
-        payload = json.loads(payload_str)
-        cmd = payload.get("cmd", "")
+        fields = message.fields or {}
+        cmd = fields.get("cmd", "")
         _log("LXMF command: " + cmd, 1)
         if cmd == "pump_on":
             _log("Pump ON", 1)
             # TODO: drive pump relay GPIO
         elif cmd == "pump_off":
             _log("Pump OFF", 1)
-            # TODO: drive pump relay GPIO
         else:
             _log("Unknown command: " + cmd, 1)
     except Exception as e:
@@ -123,7 +118,7 @@ def _on_lxmf_delivery(message):
 
 
 def _on_announce(destination_hash, app_data, packet):
-    global _hub_identity
+    global _hub_identity, _hub_lxmf_hash
     if app_data is None:
         return
     try:
@@ -137,6 +132,8 @@ def _on_announce(destination_hash, app_data, packet):
             ident = Identity.recall(destination_hash)
             if ident is not None:
                 _hub_identity = ident
+                _hub_lxmf_hash = Destination.hash(ident, "lxmf", "delivery")
+                Identity.remember(None, _hub_lxmf_hash, ident.get_public_key())
                 _log("Hub discovered: " + ident.hexhash)
     except Exception as e:
         _log("Announce handler error: " + str(e), 2)
@@ -147,20 +144,19 @@ def _on_announce(destination_hash, app_data, packet):
 # ---------------------------------------------------------------------------
 
 
-def _build_telemetry(readings, interface_name):
-    return {
+def _build_telemetry_fields(readings, interface_name):
+    """Build LXMF fields dict for telemetry delivery."""
+    fields = {
         "dev_id": config.NODE_NAME,
-        "device_type": config.DEVICE_TYPE,
-        "fw_ver": config.FIRMWARE_VERSION,
-        "gateway_id": config.NODE_NAME,
-        "readings": {
-            "soil_moisture_pct": readings["soil_moisture_pct"],
-            "soil_temp_c": readings["soil_temp_c"],
-            "soil_temp_valid": readings["soil_temp_valid"],
-        },
-        "bat_v": readings["bat_v"],
-        "rns_interface": interface_name,
+        "type": config.DEVICE_TYPE,
+        "fw": config.FIRMWARE_VERSION,
+        "bat": readings["bat_v"],
+        "soil_moist": readings["soil_moisture_pct"],
+        "soil_temp": readings["soil_temp_c"],
+        "soil_temp_valid": readings["soil_temp_valid"],
+        "if": interface_name,
     }
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +165,7 @@ def _build_telemetry(readings, interface_name):
 
 
 async def main():
-    global _hub_identity, _lxm_router
+    global _hub_identity, _hub_lxmf_hash, _lxm_router
 
     gc.collect()
     _log("=" * 40)
@@ -293,15 +289,14 @@ async def main():
     # 8. Send telemetry via LXMF
     # ------------------------------------------------------------------
     iface_name = _get_rns_interface_name(rns)
-    payload = json.dumps(_build_telemetry(readings, iface_name)).encode("utf-8")
 
-    if _hub_identity is not None:
-        tx_dest = Destination(
-            _hub_identity, Destination.OUT, Destination.SINGLE, "lxmf", "delivery"
+    if _hub_lxmf_hash is not None:
+        _lxm_router.send_message(
+            _hub_lxmf_hash,
+            content=b"",
+            fields=_build_telemetry_fields(readings, iface_name),
         )
-        lxm = LXMessage(tx_dest, lxmf_dest, payload)
-        _lxm_router.handle_outbound(lxm)
-        _log("Telemetry routed via LXMF to Hub: " + _hub_identity.hexhash)
+        _log("Telemetry routed via LXMF fields to Hub: " + _hub_identity.hexhash)
     else:
         _log(
             "WARN: hub not found — skipping telemetry (LXMF requires recipient identity)"

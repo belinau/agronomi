@@ -13,8 +13,18 @@ DEVICE_TYPE = "soil_node"
 FIRMWARE_VERSION = "2.0.0-mr"  # -mr = microreticulum
 
 # ---- WiFi ----
-WIFI_SSID = "FRITZ!Box 5490 ME"
-WIFI_PASS = "99141440711753817435"
+# Credentials are loaded from secrets.py (not tracked by git).
+# If secrets.py is missing, WiFi is disabled (BLE-only mode).
+WIFI_SSID = ""
+WIFI_PASS = ""
+try:
+    from secrets import WIFI_PASS as _pass
+    from secrets import WIFI_SSID as _ssid
+
+    WIFI_SSID = _ssid
+    WIFI_PASS = _pass
+except ImportError:
+    pass
 
 # ---- Deep sleep ----
 ENABLE_DEEPSLEEP = False  # Set to True for production

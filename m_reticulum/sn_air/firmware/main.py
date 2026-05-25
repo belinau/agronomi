@@ -1,7 +1,6 @@
 """µReticulum — Air Quality Node Firmware (SN-AIR-01)"""
 
 import gc
-import json
 import time
 
 import config
@@ -15,6 +14,7 @@ from urns.lxmf import LXMessage, LXMRouter
 from urns.packet import Packet
 
 _hub_identity = None
+_hub_lxmf_hash = None
 _lxm_router = None
 
 
@@ -69,17 +69,8 @@ def _find_or_create_identity(storage_path):
 
 def _on_lxmf_delivery(message):
     try:
-        # Standard LXMF: parse commands sent in the fields dictionary
         fields = message.fields or {}
         cmd = fields.get("cmd", "")
-        if not cmd and message.content:
-            try:
-                payload_str = message.content.decode("utf-8")
-                payload = json.loads(payload_str)
-                cmd = payload.get("cmd", "")
-            except:
-                pass
-
         _log("LXMF command: " + cmd, 1)
         if cmd == "vent_open":
             _log("Vent OPEN", 1)
@@ -96,7 +87,7 @@ def _on_lxmf_delivery(message):
 
 
 def _on_announce(destination_hash, app_data, packet):
-    global _hub_identity
+    global _hub_identity, _hub_lxmf_hash
     if app_data is None:
         return
     try:
@@ -110,6 +101,12 @@ def _on_announce(destination_hash, app_data, packet):
             ident = Identity.recall(destination_hash)
             if ident is not None:
                 _hub_identity = ident
+                _hub_lxmf_hash = Destination.hash(ident, "lxmf", "delivery")
+                # Seed the hub's public key under its lxmf.delivery destination hash
+                # so send_message can find it via Identity.recall(). The hub's
+                # farm.gateway_commands announce stores the key under that aspect's
+                # hash, but send_message needs it under the lxmf.delivery hash.
+                Identity.remember(None, _hub_lxmf_hash, ident.get_public_key())
                 _log("Hub discovered: " + ident.hexhash)
     except Exception as e:
         _log("Announce handler error: " + str(e), 2)
@@ -252,9 +249,7 @@ async def main():
             "hum": readings["air_humidity_pct"],
             "if": iface_name,
         }
-        _lxm_router.send_message(
-            _hub_identity.hash, content=b"", fields=telemetry_fields
-        )
+        _lxm_router.send_message(_hub_lxmf_hash, content=b"", fields=telemetry_fields)
         _log(
             "Telemetry routed natively via LXMF fields to Hub: " + _hub_identity.hexhash
         )

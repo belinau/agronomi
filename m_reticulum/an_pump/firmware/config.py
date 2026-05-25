@@ -23,8 +23,18 @@ DEVICE_TYPE = "pump_node"
 FIRMWARE_VERSION = "2.0.0-mr"  # -mr = microreticulum
 
 # ---- WiFi (optional, for indoor/greenhouse use) ----
+# Credentials are loaded from secrets.py (not tracked by git).
+# If secrets.py is missing, WiFi is disabled (BLE-only mode).
 WIFI_SSID = ""
 WIFI_PASS = ""
+try:
+    from secrets import WIFI_PASS as _pass
+    from secrets import WIFI_SSID as _ssid
+
+    WIFI_SSID = _ssid
+    WIFI_PASS = _pass
+except ImportError:
+    pass
 
 # ---- Deep sleep ----
 ENABLE_DEEPSLEEP = (
@@ -150,17 +160,10 @@ CONFIG = {
 }
 
 # ---- RNS destinations ----
-# IN:   farm.gateway_commands — receive commands from hub (SINGLE, announceable)
-# OUT:  farm.telemetry_readings — send status telemetry
-# OUT:  farm.commands_control — send ACKs back to hub
-COMMAND_IN_APP = "farm"
-COMMAND_IN_ASPECT = "gateway_commands"
-
-TELEMETRY_APP = "farm"
-TELEMETRY_ASPECT = "telemetry_readings"
-
-ACK_APP = "farm"
-ACK_ASPECT = "commands_control"
+# All communication goes through LXMF — telemetry, commands, and ACKs
+# use the same lxmf.delivery destination on the hub.
+COMMAND_APP = "farm"
+COMMAND_ASPECT = "gateway_commands"
 
 # ---- RNS announce prefix ----
 RNS_ANNOUNCE_PREFIX = "agronomi-actuator"
