@@ -8,7 +8,7 @@ Sensors: battery ADC only
 # ---- Node identity ----
 NODE_NAME = "GW-SUPPORT-01"
 DEVICE_TYPE = "support_node"
-FIRMWARE_VERSION = "2.0.0-mr"
+FIRMWARE_VERSION = "2.1.0-mr"
 
 # ---- WiFi ----
 # Credentials are loaded from secrets.py (not tracked by git).

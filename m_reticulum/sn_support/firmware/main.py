@@ -113,6 +113,16 @@ def _on_lxmf_delivery(message):
         fields = message.fields or {}
         cmd = fields.get("cmd", "")
         _log("LXMF command: " + cmd, 1)
+
+        # Firmware update commands — handled by updater module
+        if cmd in ("update_file", "update_commit"):
+            import updater
+
+            resp = updater.handle_update(fields)
+            if _hub_lxmf_hash is not None:
+                _lxm_router.send_message(_hub_lxmf_hash, content=b"", fields=resp)
+            return
+
         if cmd == "vent_open":
             _log("Vent OPEN", 1)
         elif cmd == "vent_close":
@@ -184,6 +194,7 @@ async def main():
     _log("=" * 40)
     _log("GW-SUPPORT-01 boot — µReticulum v" + config.FIRMWARE_VERSION)
     _log("=" * 40)
+    _log("Firmware update support: updater module loaded")
 
     # ------------------------------------------------------------------
     # 1. Initialise µReticulum FIRST — before WiFi
