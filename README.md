@@ -267,6 +267,70 @@ Without this seeding, `Identity.recall()` fails silently because RNS stores publ
 | BLE pairing fails | RNode not in pairing mode | Run `rnodeconf --bluetooth-pair` or set `serial_port` in config for auto-pairing |
 | Node won't wake from sleep | `ENABLE_DEEPSLEEP = False` in config | Set to `True` for production deployment |
 
+## Firmware updates
+
+Firmware updates are pushed over the mesh from the hub — no USB cable needed after initial flashing.
+
+### How it works
+
+1. You edit firmware files in this repo and commit them
+2. On the hub, run `firmware_push.py <device>` — it reads the files, hashes them, and sends them over LXMF to the node
+3. The node receives each file via `updater.py`, verifies the SHA-256 hash, and writes it to `/update/`
+4. After all files are sent, the hub sends an `update_commit` command
+5. The node writes a reboot marker and resets
+6. On next boot, `boot.py` moves files from `/update/` to `/` (overwriting old versions) and reboots again with fresh firmware
+
+The update is atomic at the file level — each file is verified before writing, and the swap only happens on a clean boot. If power is lost mid-transfer, the old firmware stays intact.
+
+### Hub-side: pushing updates
+
+```bash
+# Push latest firmware to a node (version auto-detected from config.py)
+python3 tools/firmware_push.py sn_air
+
+# Push a specific version
+python3 firmware_push.py an_pump --version 2.1.0-mr
+
+# Push files but don't trigger reboot (apply on next manual/deep-sleep reboot)
+python3 firmware_push.py an_greenhouse --no-reboot
+
+# Dry run — show what would be sent without actually sending
+python3 firmware_push.py sn_soil --dry-run
+```
+
+### Node-side: update receiver
+
+Each node includes `updater.py` (shared from `esp32c6/firmware/updater.py`). It handles two LXMF commands:
+
+- `update_file` — receives a file, verifies SHA-256, writes to `/update/<filename>`
+- `update_commit` — writes reboot marker, triggers immediate reset
+
+`boot.py` checks for pending updates on every boot (including deep-sleep wakeups) and applies them before `main.py` loads.
+
+### Files involved
+
+| File | Sent over mesh | Staged to | Purpose |
+|------|--------------|-----------|---------|
+| `main.py` | ✓ | `/update/main.py` | Node firmware |
+| `config.py` | ✓ | `/update/config.py` | Node configuration |
+| `sensors.py` | ✓ | `/update/sensors.py` | Sensor drivers |
+| `boot.py` | ✓ | `/update/boot.py` | Boot script (including update logic) |
+| `updater.py` | ✓ | `/update/updater.py` | Update receiver module |
+| `secrets.py` | ✗ never | — | WiFi credentials (stays on device) |
+| `identity` | ✗ never | — | Node identity (stays on device) |
+
+### USB fallback
+
+For initial flashing or recovery, use `mpremote`:
+
+```bash
+mpremote cp main.py :main.py
+mpremote cp config.py :config.py
+mpremote cp sensors.py :sensors.py
+mpremote cp boot.py :boot.py
+mpremote cp updater.py :updater.py
+```
+
 ## File structure
 
 ```
@@ -277,7 +341,7 @@ m_reticulum/
 │       ├── config.py      # Node configuration
 │       ├── secrets.py      # WiFi credentials (gitignored)
 │       ├── sensors.py     # DHT22 + battery drivers
-│       └── boot.py        # Minimal boot script
+│       └── boot.py        # Boot script with update support
 ├── sn_soil/          # Soil moisture/temp sensor
 │   └── firmware/...
 ├── sn_support/       # Support/gateway node (battery only)
@@ -292,8 +356,19 @@ m_reticulum/
 │       ├── config.py
 │       ├── secrets.py     # WiFi credentials (gitignored)
 │       ├── sensors.py     # Battery ADC driver
+│       ├── updater.py     # OTA update receiver
+│       ├── boot.py        # Boot script with update swap
 │       └── urns/          # µReticulum library (shared)
 ├── esp32c6/repo/     # Upstream µReticulum repository (reference)
+├── tools/
+│   ├── deploy.sh         # USB deploy script (initial flash)
+│   └── firmware_push.py  # Over-the-mesh firmware push
+├── secrets/              # Per-device WiFi credentials (gitignored, local only)
+│   ├── sn_air/secrets.py
+│   ├── sn_soil/secrets.py
+│   ├── sn_support/secrets.py
+│   ├── an_pump/secrets.py
+│   └── an_greenhouse/secrets.py
 pair_rnode.py             # BLE pairing script
 documents/
 ├── README.md              # This file

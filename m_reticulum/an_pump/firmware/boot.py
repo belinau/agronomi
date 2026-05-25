@@ -1,14 +1,34 @@
-"""µReticulum — Pump Actuator Node Boot Script (AN-PUMP-01)
+"""µReticulum — ESP32-C6 Boot Script with OTA Update Support
 
-Minimal boot.py for the pump actuator node.  Since this node never
-deep-sleeps, boot.py only runs on initial power-on or hard reset.
+Runs on every boot (including deep-sleep wakeups).  Checks for a
+pending firmware update staged in /update/ and swaps files into place
+before main.py is loaded.
+
+If /update/.reboot_needed exists, all .py files from /update/ are
+moved to / (overwriting old versions), the marker is deleted, and
+the system resets to load the new firmware.
+
+This file intentionally imports only gc, uos, and machine — no heavy
+modules.  If the update swap fails partway through, the node boots
+with whatever old files survived.
 """
 
 import gc
 
-# Garbage-collect before launching the application
+import uos
+
 gc.collect()
 
-# The MicroPython runtime automatically executes main.py after boot.py.
-# All initialisation happens in main.py — this includes the async event
-# loop that keeps the actuator node alive and listening for commands.
+# ---------------------------------------------------------------------------
+# Apply pending OTA update if one was staged
+# ---------------------------------------------------------------------------
+
+try:
+    import updater
+
+    updater.check_pending_update()
+except Exception as e:
+    # Never let update errors prevent booting with old firmware
+    print("[boot] update check failed: " + str(e))
+
+gc.collect()
